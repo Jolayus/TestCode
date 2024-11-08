@@ -1,0 +1,26 @@
+/.vscode
+/as.aup3
+/audio
+/audio_features.txt
+/average_durations.txt
+/average_phoneme_durations.txt
+/Chapter 3 Research Paper - HMM Training and Integration.docx
+/DataDisplayPythonFile.py
+/FeatureExtraction
+/FileCompressor
+/First
+/GoogleAlignment.py
+/graphite-pad-435510-f9-e4d9663fdc0b.json
+/HMMModels
+/NBRecords.aup3
+/New folder
+/phoneme_features_folder
+/Phonemes - Julius.aup3
+/RenameFiles.ps1
+/synthesized_speech.wav
+/Test
+/TestCodes
+/TestHMM.py
+/Testing of Accuracy.png
+/TrainHMMModel
+/__pycache__
