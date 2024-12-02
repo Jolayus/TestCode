@@ -3,7 +3,6 @@
 /audio
 /audio_features.txt
 /average_durations.txt
-/average_phoneme_durations.txt
 /Chapter 3 Research Paper - HMM Training and Integration.docx
 /DataDisplayPythonFile.py
 /FeatureExtraction
@@ -24,3 +23,7 @@
 /Testing of Accuracy.png
 /TrainHMMModel
 /__pycache__
+/testSpeech.py
+/pff
+/NewTest
+/src

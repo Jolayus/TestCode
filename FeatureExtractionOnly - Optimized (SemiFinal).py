@@ -1,12 +1,15 @@
-import numpy as np
-import math
 import os
 import librosa
 import joblib
+import logging
+import numpy as np
 import pyworld as pw
 
-from scipy.signal import find_peaks
+from scipy.fftpack import dct
+
 from collections import defaultdict
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Feature Extraction Class ---
 class AudioFeatureExtractor:
@@ -16,10 +19,16 @@ class AudioFeatureExtractor:
         self.frame_overlap = frame_overlap
         self.num_filters = num_filters
         self.num_ceps = num_ceps
+        
+    def frame_audio(self, signal, frame_size=None, hop_length=None):
+        if signal is None or len(signal) == 0:
+            logging.warning("Audio data is empty or None.")
+            return np.zeros((1, frame_size))
 
-    def frame_audio(self, signal):
-        frame_size = int(self.frame_duration * self.sample_rate)
-        hop_length = int(frame_size * (1 - self.frame_overlap))
+        if frame_size is None:
+            frame_size = int(self.frame_duration * self.sample_rate)
+        if hop_length is None:
+            hop_length = int(frame_size * (1 - self.frame_overlap))
 
         # Check if the signal is too short
         if len(signal) < frame_size:
@@ -27,16 +36,17 @@ class AudioFeatureExtractor:
             signal = np.concatenate((signal, padding))
 
         frames = librosa.util.frame(signal, frame_length=frame_size, hop_length=hop_length).T
+        if frames.shape[1] == 0:
+            logging.warning("Generated empty frames from audio data.")
+            return np.zeros((1, frame_size))
         return frames
 
     def apply_hamming_window(self, frames):
-        if len(frames.shape) == 1:  # Single frame (1D array)
-            window = np.hamming(len(frames))  # Apply window directly
-            return frames * window
-        else:  # Multiple frames (2D array)
-            window = np.hamming(frames.shape[1])  # Apply window to each frame
-            return frames * window
-
+        if frames is None or frames.size == 0:
+            logging.warning("Empty frames received for window application.")
+            return None
+        hamming_window = np.hamming(frames.shape[1])
+        return frames * hamming_window
 
     def hz_to_mel(self, frequency):
         return 2595 * np.log10(1 + frequency / 700)
@@ -65,25 +75,10 @@ class AudioFeatureExtractor:
 
         return mel_filter_bank
 
-    def compute_dft(self, frames):
-        dft_frames = np.fft.fft(frames, axis=1)
-        return dft_frames
-
-    def compute_dct(self, mfcc_features):
-        num_frames, num_ceps = mfcc_features.shape
-        dct_matrix = np.zeros((num_ceps, num_ceps))
-
-        # Construct DCT matrix
-        for i in range(num_ceps):
-            for j in range(num_ceps):
-                if i == 0:
-                    dct_matrix[i, j] = 1 / np.sqrt(num_ceps)
-                else:
-                    dct_matrix[i, j] = np.sqrt(2.0 / num_ceps) * np.cos((np.pi * j * (2 * i + 1)) / (2 * num_ceps))
-
-        mfcc_dct = np.dot(mfcc_features, dct_matrix.T)
-
-        return mfcc_dct
+    def apply_fft_to_windowed_frames(self, frames, zero_padding=True):
+        if zero_padding:
+            frames = np.pad(frames, ((0, 0), (0, frames.shape[1] // 2)), mode='constant')
+        return np.fft.rfft(frames)
 
     def compute_delta_coefficients(self, features, order=1):
         delta_features = librosa.feature.delta(features, order=order)
@@ -97,37 +92,40 @@ class AudioFeatureExtractor:
         mel_filter_bank = self.mel_filterbank(len(dft_frames[0]))
 
         mfcc_features = []
-        mfcc_energy_coefficients = []
 
         for dft_frame in dft_frames:
             if len(dft_frame) == 0:
                 print("Warning: Empty DFT frame encountered.")
                 continue
 
+            # Calculate mel spectrum and log mel spectrum
             mel_spectrum = np.dot(mel_filter_bank, np.abs(dft_frame[:len(mel_filter_bank[0])]) ** 2)
             log_mel_spectrum = np.log(mel_spectrum + 1e-10)
-            mfcc = np.real(np.fft.ifft(log_mel_spectrum, n=self.num_ceps))
 
-            mfcc_energy = mfcc[0]
-            mfcc = mfcc[1:self.num_ceps]
-
+            # Compute MFCCs using DCT
+            mfcc = dct(log_mel_spectrum, type=2, axis=-1, norm='ortho')[:self.num_ceps]
             mfcc_features.append(mfcc)
-            mfcc_energy_coefficients.append(mfcc_energy)
 
         if not mfcc_features:
             print("Error: No valid MFCC features.")
             return []
 
+        # Subtract mean energy for normalization
         mean_energy = np.mean(self.compute_energy(windowed_frames))
         mfcc_features = np.array(mfcc_features) - mean_energy
-        mfcc_dct = self.compute_dct(mfcc_features)
 
-        return np.array(mfcc_dct), np.array(mfcc_energy_coefficients)
+        return np.array(mfcc_features)
 
     def compute_energy(self, frames):
-        energy_features = np.sum(frames**2, axis=1)
-        energy_features = (energy_features - np.min(energy_features)) / (np.ptp(energy_features) + 1e-10)
-        return energy_features
+        energy = np.sum(frames**2, axis=1)
+        energy = (energy - np.min(energy)) / (np.max(energy) - np.min(energy) + 1e-10)  # Stable normalization
+        return energy
+    
+    def compute_f0_aperiodicity(self, audio_data, sr):
+        _f0, t = pw.dio(audio_data, sr)
+        f0 = pw.stonemask(audio_data, _f0, t, sr)
+        ap = pw.d4c(audio_data, f0, t, sr)
+        return f0, ap
 
     def extract_features_from_audio(self, audio_data):
         if audio_data is None or len(audio_data) == 0:
@@ -145,12 +143,12 @@ class AudioFeatureExtractor:
             print("Frames contain zeros. Min:", np.min(frames), "Max:", np.max(frames))
 
         windowed_frames = self.apply_hamming_window(frames)
-        dft_frames = self.compute_dft(windowed_frames)
+        dft_frames = self.apply_fft_to_windowed_frames(windowed_frames)
 
         if dft_frames.size == 0:
             raise ValueError("Error: Invalid DFT frames.")
 
-        mfcc_dct_features, mfcc_energy_coefficients_features = self.compute_mfcc_with_dct(dft_frames, windowed_frames)
+        mfcc_dct_features = self.compute_mfcc_with_dct(dft_frames, windowed_frames)
 
         if mfcc_dct_features.size == 0:
             print("Error: MFCC DCT features are empty or invalid.")
@@ -167,30 +165,37 @@ class AudioFeatureExtractor:
 
         # Use pyworld to extract F0 and aperiodicity
         # Convert each frame to a continuous signal (since pyworld processes the whole signal)
+        # Use the compute_f0_aperiodicity function to extract F0 and aperiodicity
         for frame in windowed_frames:
             frame = frame.astype(np.float64)  # PyWorld requires float64
-
-            # Use Harvest to extract F0
-            f0, time_axis = pw.harvest(frame, self.sample_rate)
-
-            # Use D4C to extract aperiodicity
-            ap = pw.d4c(frame, f0, time_axis, self.sample_rate)
-
+            
+            # Compute F0 and aperiodicity using the function
+            f0, ap = self.compute_f0_aperiodicity(frame, self.sample_rate)
+            
             # Append the mean values per frame to align with other features (1 value per frame)
             f0_features.append(np.mean(f0))
             aperiodicity_features.append(np.mean(ap))
 
         return {
-            "mfcc_0th": mfcc_energy_coefficients_features[:, np.newaxis],               # 0th MFCC (1 feature per frame)
-            "mfcc_features": mfcc_dct_features,                                         # MFCC (1st to 12th coefficients)
-            "delta_features": delta_features,                                           # Delta features (1st to 12th MFCC)
-            "delta_delta_features": delta_delta_features,                               # Delta-Delta features (1st to 12th MFCC)
+            "mfcc_features": mfcc_dct_features,                                         # MFCC (1st to 13th coefficients)
+            "delta_features": delta_features,                                           # Delta features (1st to 13th MFCC)
+            "delta_delta_features": delta_delta_features,                               # Delta-Delta features (1st to 13th MFCC)
             "energy_features": energy_features[:, np.newaxis],                          # Energy feature (1 per frame)
             "f0_features": np.array(f0_features)[:, np.newaxis],                        # F0 feature (1 per frame)
             "aperiodicity_features": np.array(aperiodicity_features)[:, np.newaxis]     # Aperiodicity feature (1 per frame)
         }
 
 # Helper functions
+def load_audio_file(filepath):
+    if not os.path.exists(filepath):
+        logging.error(f"File not found: {filepath}")
+        return None
+    audio_data, sr = librosa.load(filepath, sr=None)
+    if audio_data is None or len(audio_data) == 0:
+        logging.warning(f"Empty or invalid audio data in file: {filepath}")
+        return None
+    return audio_data, sr
+
 def load_alignment_file(alignment_file):
     with open(alignment_file, "r") as f:
         alignments = []
@@ -229,6 +234,11 @@ if __name__ == "__main__":
     phoneme_dir = "Phonemes"
     for folder_name in os.listdir(phoneme_dir):
         folder_path = os.path.join(phoneme_dir, folder_name)
+        
+        # Check if directory exists before processing
+        if not os.path.exists(folder_path):
+            print(f"Error: Directory {folder_path} does not exist.")
+        
         if os.path.isdir(folder_path):
             for phoneme_file in os.listdir(folder_path):
                 if phoneme_file.endswith('.wav'):
@@ -237,23 +247,31 @@ if __name__ == "__main__":
                     print(phoneme_file_path)
                     
                     # Load the phoneme audio file
-                    phoneme_data, phoneme_sample_rate = librosa.load(phoneme_file_path, sr=16000)
+                    phoneme_data, phoneme_sample_rate = load_audio_file(phoneme_file_path)
                     
-                    # Extract features from the phoneme audio
-                    phoneme_features = feature_extractor.extract_features_from_audio(phoneme_data)
-                    
-                    # Get phoneme from filename (e.g., "a.wav" -> "a")
-                    phoneme = phoneme_file.split(".")[0]
-                    
-                    # Store features in the phoneme features map
-                    phoneme_features_map[phoneme].append(phoneme_features)
+                    if phoneme_data is not None:
+                        # Extract features from the phoneme audio
+                        phoneme_features = feature_extractor.extract_features_from_audio(phoneme_data)
+                        
+                        # Get phoneme from filename (e.g., "a.wav" -> "a")
+                        phoneme = phoneme_file.split(".")[0]
+                        
+                        # Store features in the phoneme features map
+                        phoneme_features_map[phoneme].append(phoneme_features)
                     
     # Loop through the dataset and alignment directories
     dataset_dir = "Audio WAV Files"
     alignment_dir = "Alignment"
     for dataset_folder in os.listdir(dataset_dir):
         dataset_folder_path = os.path.join(dataset_dir, dataset_folder)
+        
+        if not os.path.exists(dataset_folder_path):
+            print(f"Error: Directory {dataset_folder_path} does not exist.")
+        
         alignment_folder_path = os.path.join(alignment_dir, dataset_folder)
+        
+        if not os.path.exists(alignment_folder_path):
+            print(f"Error: Directory {alignment_folder_path} does not exist.")
         
         if os.path.isdir(dataset_folder_path) and os.path.isdir(alignment_folder_path):
             for audio_file in os.listdir(dataset_folder_path):
@@ -261,32 +279,33 @@ if __name__ == "__main__":
                     # Load the WAV file
                     audio_file_path = os.path.join(dataset_folder_path, audio_file)
                     print(audio_file_path)
-                    audio_data, sample_rate = librosa.load(audio_file_path, sr=16000)
+                    audio_data, sample_rate = load_audio_file(audio_file_path)
 
-                    # Find the corresponding alignment folder for this audio file
-                    alignment_subfolder_path = os.path.join(alignment_folder_path, audio_file.split(".")[0])
+                    if audio_data is not None:
+                        # Find the corresponding alignment folder for this audio file
+                        alignment_subfolder_path = os.path.join(alignment_folder_path, audio_file.split(".")[0])
 
-                    if os.path.isdir(alignment_subfolder_path):
-                        # Loop through all alignment files for the audio file
-                        for alignment_file in os.listdir(alignment_subfolder_path):
-                            if alignment_file.endswith('.txt'):
-                                # Load the alignment file
-                                alignment_file_path = os.path.join(alignment_subfolder_path, alignment_file)
-                                print(alignment_file_path)
-                                alignments = load_alignment_file(alignment_file_path)
-                                
-                                # Loop through alignments and extract features
-                                for i, (phoneme, start_time, end_time) in enumerate(alignments):
-                                    start_sample, end_sample = time_to_samples(start_time, end_time, sample_rate)
+                        if os.path.isdir(alignment_subfolder_path):
+                            # Loop through all alignment files for the audio file
+                            for alignment_file in os.listdir(alignment_subfolder_path):
+                                if alignment_file.endswith('.txt'):
+                                    # Load the alignment file
+                                    alignment_file_path = os.path.join(alignment_subfolder_path, alignment_file)
+                                    print(alignment_file_path)
+                                    alignments = load_alignment_file(alignment_file_path)
                                     
-                                    # Extract the phoneme audio segment
-                                    audio_segment = extract_audio_segment(audio_data, start_sample, end_sample)
+                                    # Loop through alignments and extract features
+                                    for i, (phoneme, start_time, end_time) in enumerate(alignments):
+                                        start_sample, end_sample = time_to_samples(start_time, end_time, sample_rate)
+                                        
+                                        # Extract the phoneme audio segment
+                                        audio_segment = extract_audio_segment(audio_data, start_sample, end_sample)
 
-                                    # Extract features from the audio segment
-                                    features = feature_extractor.extract_features_from_audio(audio_segment)
-                                    
-                                    # Append features to the phoneme in the phoneme features map
-                                    phoneme_features_map[phoneme].append(features)
+                                        # Extract features from the audio segment
+                                        features = feature_extractor.extract_features_from_audio(audio_segment)
+                                        
+                                        # Append features to the phoneme in the phoneme features map
+                                        phoneme_features_map[phoneme].append(features)
 
 # create a folder to store the pkl files
 folder_name = 'phoneme_features_folder'
